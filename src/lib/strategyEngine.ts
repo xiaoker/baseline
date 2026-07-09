@@ -77,7 +77,7 @@ export function deriveFactorStrategicAssessment(factors: FactorState[]): FactorS
   const totalAverage = (denominator.score + macro.score) / 2;
   const evidence = [
     `总量分母 ${denominator.score}，总量分子 ${macro.score}，结构分子 ${structure.score}。`,
-    `结构分子相对次强因子差值 ${structureLead}，总量均值 ${Math.round(totalAverage)}。`
+    `结构分子相对次强因子差值 ${Math.round(structureLead)}，总量均值 ${Math.round(totalAverage)}。`
   ];
 
   if (structure.score >= 70 && structureLead >= 10 && denominator.score >= 45) {
@@ -492,6 +492,18 @@ export function buildDashboardState(input: MarketScenarioInput, dataFreshness: D
   const interval = deriveIntervalState(input.breadth, input.mediumBaseline, input.shortBaseline);
   const quadrants = enrichQuadrants(input.candidates, interval, input.breadth);
   const portfolioPlan = buildPortfolioPlan(input.date, interval, quadrants);
+  const adjustedPortfolioPlan: PortfolioPlan =
+    dataFreshness === "stale"
+      ? {
+          ...portfolioPlan,
+          riskLight: portfolioPlan.riskLight === "red" ? "red" : ("yellow" as const),
+          posture: `部分数据：${portfolioPlan.posture}`,
+          actionNotes: [
+            "本日行情宽度或板块候选不完整，组合动作只能作为观察建议，不应升级为执行信号。",
+            ...portfolioPlan.actionNotes
+          ]
+        }
+      : portfolioPlan;
 
   return {
     date: input.date,
@@ -504,7 +516,7 @@ export function buildDashboardState(input: MarketScenarioInput, dataFreshness: D
     baselineEngine,
     interval,
     quadrants,
-    portfolioPlan,
+    portfolioPlan: adjustedPortfolioPlan,
     dataFreshness,
     generatedAt: new Date().toISOString()
   };
