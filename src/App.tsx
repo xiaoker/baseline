@@ -750,19 +750,63 @@ function ReviewView({ dashboard }: { dashboard: DashboardState }) {
 }
 
 function DataSourcesView({ state }: { state: DataSourceDashboard }) {
-  const [sources, setSources] = useState<DataSourceConfig[]>(state.sources);
+  const [drafts, setDrafts] = useState<SourceDraft[]>(() => state.sources.map(createSourceDraft));
   const [saveMessage, setSaveMessage] = useState("配置来自默认配置或 D1；本地预览可修改但不一定写入远端。");
+  const [savingAll, setSavingAll] = useState(false);
+  const sources = drafts.map((draft) => draft.source);
   const enabledCount = sources.filter((source) => source.enabled).length;
   const successCount = state.runs.filter((run) => run.status === "success").length;
 
   useEffect(() => {
-    setSources(state.sources);
+    setDrafts(state.sources.map(createSourceDraft));
   }, [state.sources]);
 
-  const handleSave = async (source: DataSourceConfig) => {
-    setSources((current) => current.map((item) => (item.id === source.id ? source : item)));
-    const persisted = await updateDataSource(source);
-    setSaveMessage(persisted ? `已保存 ${source.name} 到 D1。` : `已在当前页面更新 ${source.name}；API 不可用或本地 Vite 预览未连接 D1。`);
+  const updateDraft = (id: string, next: SourceDraft) => {
+    setDrafts((current) => current.map((draft) => (draft.source.id === id ? next : draft)));
+  };
+
+  const handleSave = async (id: string) => {
+    const draft = drafts.find((item) => item.source.id === id);
+    if (!draft) return;
+    const parsed = materializeSourceDraft(draft);
+    if (!parsed.source) {
+      updateDraft(id, { ...draft, error: parsed.error ?? "配置未通过校验。", dirty: true });
+      return;
+    }
+
+    updateDraft(id, { ...createSourceDraft(parsed.source), dirty: false });
+    const persisted = await updateDataSource(parsed.source);
+    setSaveMessage(
+      persisted ? `已保存 ${parsed.source.name} 到 D1。` : `已在当前页面更新 ${parsed.source.name}；API 不可用或本地 Vite 预览未连接 D1。`
+    );
+  };
+
+  const saveAll = async () => {
+    setSavingAll(true);
+    const parsedDrafts = drafts.map((draft) => ({ draft, parsed: materializeSourceDraft(draft) }));
+    const invalidDrafts = parsedDrafts.filter((item) => !item.parsed.source);
+    if (invalidDrafts.length) {
+      setDrafts((current) =>
+        current.map((draft) => {
+          const invalid = invalidDrafts.find((item) => item.draft.source.id === draft.source.id);
+          return invalid ? { ...draft, error: invalid.parsed.error ?? "配置未通过校验。", dirty: true } : { ...draft, error: "" };
+        })
+      );
+      setSaveMessage(`有 ${invalidDrafts.length} 个数据源配置 JSON 不合法，已停止批量保存。`);
+      setSavingAll(false);
+      return;
+    }
+
+    const parsedSources = parsedDrafts.map((item) => item.parsed.source as DataSourceConfig);
+    const results = await Promise.all(parsedSources.map((source) => updateDataSource(source)));
+    setDrafts(parsedSources.map((source) => ({ ...createSourceDraft(source), dirty: false })));
+    const persistedCount = results.filter(Boolean).length;
+    setSaveMessage(
+      persistedCount === parsedSources.length
+        ? `已全部保存 ${persistedCount} 个数据源到 D1。`
+        : `已在当前页面更新 ${parsedSources.length} 个数据源；其中 ${persistedCount} 个写入 D1 成功。`
+    );
+    setSavingAll(false);
   };
 
   return (
@@ -782,11 +826,24 @@ function DataSourcesView({ state }: { state: DataSourceDashboard }) {
       <section className="table-section">
         <div className="section-heading">
           <h2>数据源配置</h2>
-          <span>可编辑；部署后写入 `data_sources`</span>
+          <div className="section-actions">
+            <span>可编辑；部署后写入 `data_sources`</span>
+            <button className="save-button" onClick={saveAll} disabled={savingAll}>
+              <Save size={16} />
+              <span>{savingAll ? "保存中" : "全部保存"}</span>
+            </button>
+          </div>
         </div>
         <div className="source-grid">
-          {sources.map((source) => (
-            <SourceCard key={source.id} source={source} latestRun={state.runs.find((run) => run.sourceId === source.id)} onSave={handleSave} />
+          {drafts.map((draft) => (
+            <SourceCard
+              key={draft.source.id}
+              draft={draft}
+              latestRun={state.runs.find((run) => run.sourceId === draft.source.id)}
+              onDraftChange={(next) => updateDraft(draft.source.id, next)}
+              onSave={() => handleSave(draft.source.id)}
+              saving={savingAll}
+            />
           ))}
         </div>
       </section>
@@ -811,42 +868,58 @@ function DataSourcesView({ state }: { state: DataSourceDashboard }) {
   );
 }
 
-function SourceCard({
-  source,
-  latestRun,
-  onSave
-}: {
+type SourceDraft = {
   source: DataSourceConfig;
-  latestRun?: CollectionRun;
-  onSave: (source: DataSourceConfig) => Promise<void>;
-}) {
-  const [draft, setDraft] = useState<DataSourceConfig>(source);
-  const [configText, setConfigText] = useState(JSON.stringify(source.config, null, 2));
-  const [targetTablesText, setTargetTablesText] = useState(source.targetTables.join(", "));
-  const [error, setError] = useState("");
+  configText: string;
+  targetTablesText: string;
+  error: string;
+  dirty: boolean;
+};
 
-  useEffect(() => {
-    setDraft(source);
-    setConfigText(JSON.stringify(source.config, null, 2));
-    setTargetTablesText(source.targetTables.join(", "));
-  }, [source]);
+function createSourceDraft(source: DataSourceConfig): SourceDraft {
+  return {
+    source,
+    configText: JSON.stringify(source.config, null, 2),
+    targetTablesText: source.targetTables.join(", "),
+    error: "",
+    dirty: false
+  };
+}
+
+function materializeSourceDraft(draft: SourceDraft): { source?: DataSourceConfig; error?: string } {
+  try {
+    const parsedConfig = JSON.parse(draft.configText) as Record<string, unknown>;
+    const targetTables = draft.targetTablesText
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return { source: { ...draft.source, config: parsedConfig, targetTables } };
+  } catch {
+    return { error: "配置 JSON 不是合法格式，未保存。" };
+  }
+}
+
+function SourceCard({
+  draft,
+  latestRun,
+  onDraftChange,
+  onSave,
+  saving
+}: {
+  draft: SourceDraft;
+  latestRun?: CollectionRun;
+  onDraftChange: (draft: SourceDraft) => void;
+  onSave: () => Promise<void>;
+  saving: boolean;
+}) {
+  const { source, configText, targetTablesText, error, dirty } = draft;
 
   const setField = <K extends keyof DataSourceConfig>(key: K, value: DataSourceConfig[K]) => {
-    setDraft((current) => ({ ...current, [key]: value }));
+    onDraftChange({ ...draft, source: { ...source, [key]: value }, dirty: true, error: "" });
   };
 
   const save = async () => {
-    try {
-      const parsedConfig = JSON.parse(configText) as Record<string, unknown>;
-      const targetTables = targetTablesText
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean);
-      setError("");
-      await onSave({ ...draft, config: parsedConfig, targetTables });
-    } catch {
-      setError("配置 JSON 不是合法格式，未保存。");
-    }
+    await onSave();
   };
 
   return (
@@ -857,49 +930,57 @@ function SourceCard({
           <span>{source.provider}｜{source.category}</span>
         </div>
         <label className="source-toggle">
-          <input type="checkbox" checked={draft.enabled} onChange={(event) => setField("enabled", event.target.checked)} />
-          <span className={draft.enabled ? "status-pill enabled" : "status-pill disabled"}>{draft.enabled ? "启用" : "暂停"}</span>
+          <input type="checkbox" checked={source.enabled} onChange={(event) => setField("enabled", event.target.checked)} />
+          <span className={source.enabled ? "status-pill enabled" : "status-pill disabled"}>{source.enabled ? "启用" : "暂停"}</span>
         </label>
       </div>
 
       <label className="source-field">
         <span>用途</span>
-        <textarea value={draft.purpose} onChange={(event) => setField("purpose", event.target.value)} rows={3} />
+        <textarea value={source.purpose} onChange={(event) => setField("purpose", event.target.value)} rows={3} />
       </label>
 
       <div className="source-meta">
         <label>
           <span>调度</span>
-          <input value={draft.schedule} onChange={(event) => setField("schedule", event.target.value)} />
+          <input value={source.schedule} onChange={(event) => setField("schedule", event.target.value)} />
         </label>
         <label>
           <span>新鲜度 h</span>
           <input
             type="number"
             min={1}
-            value={draft.freshnessHours}
+            value={source.freshnessHours}
             onChange={(event) => setField("freshnessHours", Number(event.target.value))}
           />
         </label>
         <label>
           <span>责任方</span>
-          <input value={draft.owner} onChange={(event) => setField("owner", event.target.value)} />
+          <input value={source.owner} onChange={(event) => setField("owner", event.target.value)} />
         </label>
       </div>
 
       <label className="source-field">
         <span>目标表</span>
-        <input value={targetTablesText} onChange={(event) => setTargetTablesText(event.target.value)} />
+        <input
+          value={targetTablesText}
+          onChange={(event) => onDraftChange({ ...draft, targetTablesText: event.target.value, dirty: true, error: "" })}
+        />
       </label>
 
       <div className="implementation-box">
         <strong>采集实现</strong>
-        <span>{formatImplementation(draft)}</span>
+        <span>{formatImplementation(source)}</span>
       </div>
 
       <label className="source-field">
         <span>配置 JSON</span>
-        <textarea className="code-textarea" value={configText} onChange={(event) => setConfigText(event.target.value)} rows={8} />
+        <textarea
+          className="code-textarea"
+          value={configText}
+          onChange={(event) => onDraftChange({ ...draft, configText: event.target.value, dirty: true, error: "" })}
+          rows={8}
+        />
       </label>
 
       {latestRun && (
@@ -917,13 +998,13 @@ function SourceCard({
 
       <label className="source-field">
         <span>备注</span>
-        <textarea value={draft.notes} onChange={(event) => setField("notes", event.target.value)} rows={2} />
+        <textarea value={source.notes} onChange={(event) => setField("notes", event.target.value)} rows={2} />
       </label>
 
       {error && <span className="form-error">{error}</span>}
-      <button className="save-button" onClick={save}>
+      <button className="save-button" onClick={save} disabled={saving}>
         <Save size={16} />
-        <span>保存配置</span>
+        <span>{dirty ? "保存配置" : "已同步"}</span>
       </button>
     </article>
   );
