@@ -2,10 +2,12 @@ name = "baseline"
 compatibility_date = "2026-07-07"
 pages_build_output_dir = "dist"
 
-[[d1_databases]]
-binding = "DB"
-database_name = "a-share-model-dashboard"
-database_id = "edc84fa3-9cc4-49a1-b53c-3c580df85e68"
+# After creating a new D1 database, add the binding here:
+#
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "your-d1-database-name"
+# database_id = "your-d1-database-id"
 
 [vars]
 APP_ENV = "production"

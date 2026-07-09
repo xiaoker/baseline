@@ -26,12 +26,16 @@ npm run pages:dev
 ## D1 初始化
 
 ```bash
-npx wrangler d1 create a-share-model-dashboard
-npx wrangler d1 execute a-share-model-dashboard --local --file migrations/0001_initial.sql
-npx wrangler d1 execute a-share-model-dashboard --local --file data/seed.sql
+npx wrangler d1 create your-d1-database-name
+npx wrangler d1 execute your-d1-database-name --local --file migrations/0001_initial.sql
+npx wrangler d1 execute your-d1-database-name --local --file data/seed.sql
 ```
 
-把创建出来的 `database_id` 写入 `wrangler.toml` 后再部署。
+把创建出来的 `database_id` 写入 `wrangler.toml` 后再部署。GitHub Actions 采集任务还需要配置仓库 secret：
+
+- `D1_DATABASE_NAME`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_API_TOKEN`
 
 ## 核心文件
 

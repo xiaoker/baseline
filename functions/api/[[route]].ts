@@ -22,7 +22,7 @@ const app = new Hono<{ Bindings: Bindings }>().basePath("/api");
 app.get("/health", (c) =>
   c.json({
     ok: true,
-    service: "a-share-model-dashboard",
+    service: "baseline",
     generatedAt: new Date().toISOString()
   })
 );
