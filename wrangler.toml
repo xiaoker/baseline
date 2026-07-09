@@ -2,12 +2,10 @@ name = "baseline"
 compatibility_date = "2026-07-07"
 pages_build_output_dir = "dist"
 
-# After creating a new D1 database, add the binding here:
-#
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "your-d1-database-name"
-# database_id = "your-d1-database-id"
+[[d1_databases]]
+binding = "DB"
+database_name = "baseline"
+database_id = "9d9136d8-e1f7-4766-815d-4750998641b6"
 
 [vars]
 APP_ENV = "production"
