@@ -15,7 +15,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - run: npm install
+          cache: "npm"
+      - run: npm ci
       - run: npm run test
       - run: npm run build
       - run: npx wrangler pages deploy dist --project-name baseline

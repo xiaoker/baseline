@@ -19,8 +19,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: "npm"
       - run: pip install -r requirements.txt
-      - run: npm install
+      - run: npm ci
       - run: python scripts/collect_market_data.py
       - run: npx wrangler d1 execute a-share-model-dashboard --remote --file tmp/d1-import.sql
         env:
