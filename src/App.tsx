@@ -74,7 +74,7 @@ const factorOutlookLabel = {
 
 const freshnessLabel = {
   live: "实时数据",
-  stale: "数据过期",
+  stale: "部分数据",
   empty: "等待数据"
 };
 
@@ -148,6 +148,7 @@ function App() {
         </header>
 
         {dashboard.dataFreshness === "empty" && view !== "sources" && <EmptyDashboardView />}
+        {dashboard.dataFreshness === "stale" && view !== "sources" && <PartialDataNotice />}
         {dashboard.dataFreshness !== "empty" && view === "dashboard" && <DashboardView dashboard={dashboard} factorChartData={factorChartData} />}
         {dashboard.dataFreshness !== "empty" && view === "factors" && <FactorsView dashboard={dashboard} factorChartData={factorChartData} />}
         {dashboard.dataFreshness !== "empty" && view === "baseline" && <BaselineView dashboard={dashboard} />}
@@ -157,6 +158,15 @@ function App() {
         {dashboard.dataFreshness !== "empty" && view === "review" && <ReviewView dashboard={dashboard} />}
       </main>
     </div>
+  );
+}
+
+function PartialDataNotice() {
+  return (
+    <section className="data-warning">
+      <ShieldAlert size={18} />
+      <span>本日模型为部分数据状态：系统已展示可计算的三因子和基线，但缺失的行情宽度或板块候选会按中性低置信度处理。</span>
+    </section>
   );
 }
 

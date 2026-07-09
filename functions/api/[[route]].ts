@@ -215,7 +215,7 @@ async function loadDashboard(db?: D1Database, date?: string): Promise<DashboardS
       .bind(selectedDate)
       .all<Record<string, unknown>>();
 
-    if (!factorRows.results.length || !medium || !short || !breadth || !candidateRows.results.length) {
+    if (!hasCompleteFactorSet(factorRows.results) || !medium || !short) {
       return createEmptyDashboard(selectedDate);
     }
 
@@ -229,29 +229,19 @@ async function loadDashboard(db?: D1Database, date?: string): Promise<DashboardS
       metrics: [],
       evidence: parseJson<string[]>(row.evidence_json, [])
     }));
+    const dataFreshness: DashboardState["dataFreshness"] = !breadth || !candidateRows.results.length ? "stale" : "live";
 
     const scenario: MarketScenarioInput = {
       date: selectedDate,
-      title: `${selectedDate} 模型化A股决策驾驶舱`,
+      title: `${selectedDate} 模型化A股决策驾驶舱${dataFreshness === "stale" ? "（部分数据）" : ""}`,
       factors,
-      breadth: {
-        advancers: Number(breadth.advancers ?? 0),
-        decliners: Number(breadth.decliners ?? 0),
-        limitUp: Number(breadth.limit_up ?? 0),
-        limitDown: Number(breadth.limit_down ?? 0),
-        turnoverCnyBn: Number(breadth.turnover_cny_bn ?? 0),
-        volatilityScore: Number(breadth.volatility_score ?? 50),
-        dispersionScore: Number(breadth.dispersion_score ?? 50),
-        sentimentScore: Number(breadth.sentiment_score ?? 50),
-        premiumDiscountScore: Number(breadth.premium_discount_score ?? 50),
-        heatScore: Number(breadth.heat_score ?? 50)
-      },
+      breadth: breadthFromRow(breadth),
       mediumBaseline: baselineFromRow(medium, "medium"),
       shortBaseline: baselineFromRow(short, "short"),
       candidates: candidateRows.results.map(candidateFromRow)
     };
 
-    return buildDashboardState(scenario, "live");
+    return buildDashboardState(scenario, dataFreshness);
   } catch {
     return createEmptyDashboard(date);
   }
@@ -268,6 +258,26 @@ function parseJson<T>(value: unknown, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function hasCompleteFactorSet(rows: Array<{ factor_id: FactorState["id"] }>) {
+  const ids = new Set(rows.map((row) => row.factor_id));
+  return ids.has("liquidity_denominator") && ids.has("macro_numerator") && ids.has("structure_numerator");
+}
+
+function breadthFromRow(row: Record<string, unknown> | null) {
+  return {
+    advancers: Number(row?.advancers ?? 0),
+    decliners: Number(row?.decliners ?? 0),
+    limitUp: Number(row?.limit_up ?? 0),
+    limitDown: Number(row?.limit_down ?? 0),
+    turnoverCnyBn: Number(row?.turnover_cny_bn ?? 0),
+    volatilityScore: Number(row?.volatility_score ?? 50),
+    dispersionScore: Number(row?.dispersion_score ?? 50),
+    sentimentScore: Number(row?.sentiment_score ?? 50),
+    premiumDiscountScore: Number(row?.premium_discount_score ?? 50),
+    heatScore: Number(row?.heat_score ?? 50)
+  };
 }
 
 function baselineFromRow(row: Record<string, unknown>, horizon: "medium" | "short") {

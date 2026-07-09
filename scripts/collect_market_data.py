@@ -303,34 +303,49 @@ def derive_model_state(
   macro_observations: list[dict[str, Any]],
 ) -> list[str]:
   statements: list[str] = []
-  if not breadth:
-    statements.append("-- model derivation skipped: market_breadth unavailable")
-    return statements
+  breadth_available = breadth is not None
+  effective_breadth = breadth or {
+    "advancers": 0,
+    "decliners": 0,
+    "limit_up": 0,
+    "limit_down": 0,
+    "turnover_cny_bn": 0,
+    "volatility_score": 50,
+    "dispersion_score": 50,
+    "sentiment_score": 50,
+    "premium_discount_score": 50,
+    "heat_score": 50,
+  }
+  if not breadth_available:
+    statements.append("-- market_breadth unavailable: deriving partial low-confidence model state with neutral breadth fallback")
 
   top_boards = boards[:12]
   top_names = [item["name"] for item in top_boards[:5]]
-  positive_board_ratio = sum(1 for item in boards if item["pct"] > 0) / max(len(boards), 1) if boards else 0
+  positive_board_ratio = sum(1 for item in boards if item["pct"] > 0) / max(len(boards), 1) if boards else 0.5
   top_strength = sum(item["strength_score"] for item in top_boards[:5]) / max(len(top_boards[:5]), 1) if top_boards else 50
   top_heat = sum(item["heat_score"] for item in top_boards[:5]) / max(len(top_boards[:5]), 1) if top_boards else 50
   offshore_risk_pressure = anchor_trend(anchor_rows, ["DX-Y.NYB", "^TNX", "USDCNY=X"])
   offshore_relief = 100 - offshore_risk_pressure
   risk_appetite = clamp(
-    breadth["sentiment_score"] * 0.28
-    + breadth["heat_score"] * 0.26
-    + (100 - breadth["volatility_score"]) * 0.22
+    effective_breadth["sentiment_score"] * 0.28
+    + effective_breadth["heat_score"] * 0.26
+    + (100 - effective_breadth["volatility_score"]) * 0.22
     + offshore_relief * 0.24
   )
   denominator_score = clamp(risk_appetite)
   denominator_evidence = [
-    f"市场情绪 {breadth['sentiment_score']:.1f}，成交热度 {breadth['heat_score']:.1f}，波动压力 {breadth['volatility_score']:.1f}。",
+    f"市场情绪 {effective_breadth['sentiment_score']:.1f}，成交热度 {effective_breadth['heat_score']:.1f}，波动压力 {effective_breadth['volatility_score']:.1f}。",
     f"美元/美债/人民币外部压力均值 {offshore_risk_pressure:.1f}，分母端按反向压力折算。",
   ]
+  if not breadth_available:
+    denominator_evidence.append("A股市场宽度未成功采集，情绪、热度和波动率按 50 中性值处理，本日分母置信度下调。")
+  denominator_confidence = 0.72 if breadth_available and anchor_rows else 0.46 if breadth_available or anchor_rows else 0.22
   statements.append(
     factor_state_sql(
       trade_date,
       "liquidity_denominator",
       denominator_score,
-      0.72 if anchor_rows else 0.58,
+      denominator_confidence,
       "由市场成交、情绪、波动率和外部利率/汇率锚自动生成。",
       denominator_evidence,
     )
@@ -372,7 +387,11 @@ def derive_model_state(
   )
 
   anchor_support = anchor_trend(anchor_rows, ["HG=F", "ALI=F", "GC=F", "AMAT", "NVDA"])
-  structure_score = clamp(top_strength * 0.48 + top_heat * 0.18 + positive_board_ratio * 100 * 0.18 + anchor_support * 0.16)
+  structure_score = (
+    clamp(top_strength * 0.48 + top_heat * 0.18 + positive_board_ratio * 100 * 0.18 + anchor_support * 0.16)
+    if top_boards
+    else clamp(50 + (anchor_support - 50) * 0.2)
+  )
   structure_confidence = 0.72 if top_boards else 0.35
   if not top_boards:
     structure_summary = "未成功获取行业/概念板块强弱，结构分子保持中性低置信度。"
@@ -416,7 +435,7 @@ def derive_model_state(
       "hot_money": clamp(42 + board["pct"] * 7.5 + board["turnover"] * 3 + (8 if board["kind"] == "concept" else 0)),
       "narrative_strength": clamp(45 + board["heat_score"] * 0.45 + (8 if board["kind"] == "concept" else 2)),
       "trend_score": board["strength_score"],
-      "entropy_score": clamp(breadth["dispersion_score"] * 0.5 + breadth["volatility_score"] * 0.32 + board["turnover"] * 1.2),
+      "entropy_score": clamp(effective_breadth["dispersion_score"] * 0.5 + effective_breadth["volatility_score"] * 0.32 + board["turnover"] * 1.2),
       "liquidity_score": board["liquidity_score"],
       "evidence": evidence,
     }
@@ -459,8 +478,8 @@ def derive_model_state(
       ["核心主题跌出强势前列", "结构分子低于 55", "总量分母跌破 40"],
       medium_evidence,
       medium_confidence,
-      breadth["sentiment_score"],
-      "normal" if breadth["volatility_score"] < 62 else "expanded",
+      effective_breadth["sentiment_score"],
+      "normal" if effective_breadth["volatility_score"] < 62 else "expanded",
     )
   )
 
@@ -468,14 +487,16 @@ def derive_model_state(
   hot_names = [item["name"] for item in hot_boards]
   overlap = len(set(hot_names[:3]) & set(medium_core[:5]))
   connection_score = clamp(45 + overlap * 14 + max(0, structure_score - 55) * 0.35)
-  short_direction = "up" if breadth["sentiment_score"] >= 58 and hot_names else "flat"
+  short_direction = "up" if effective_breadth["sentiment_score"] >= 58 and hot_names else "flat"
   short_stance = "risk_on" if connection_score >= 65 and denominator_score >= 45 else "balanced"
-  volatility_mode = "expanded" if breadth["volatility_score"] >= 62 or breadth["dispersion_score"] >= 66 else "normal"
+  volatility_mode = "expanded" if effective_breadth["volatility_score"] >= 62 or effective_breadth["dispersion_score"] >= 66 else "normal"
   short_evidence = [
     f"短期热度主题：{'、'.join(hot_names) if hot_names else '暂无'}。",
     f"短期主题与中期核心重合数 {overlap}，连接度 {connection_score:.1f}。",
-    f"情绪 {breadth['sentiment_score']:.1f}，波动 {breadth['volatility_score']:.1f}，离散度 {breadth['dispersion_score']:.1f}。",
+    f"情绪 {effective_breadth['sentiment_score']:.1f}，波动 {effective_breadth['volatility_score']:.1f}，离散度 {effective_breadth['dispersion_score']:.1f}。",
   ]
+  if not breadth_available:
+    short_evidence.append("A股宽度缺失，短期情绪抓手按中性低置信度处理。")
   statements.append(
     baseline_state_sql(
       trade_date,
@@ -483,13 +504,13 @@ def derive_model_state(
       " / ".join(hot_names[:3]) if hot_names else "等待短期故事",
       short_direction,
       short_stance,
-      clamp(breadth["sentiment_score"] * 0.42 + top_heat * 0.34 + connection_score * 0.24),
+      clamp(effective_breadth["sentiment_score"] * 0.42 + top_heat * 0.34 + connection_score * 0.24),
       hot_names,
       hot_names,
       ["高热主题跌出强势前列", "连接度低于 45", "市场宽度快速转弱"],
       short_evidence,
       connection_score,
-      breadth["sentiment_score"],
+      effective_breadth["sentiment_score"],
       volatility_mode,
     )
   )
@@ -501,12 +522,15 @@ def derive_model_state(
       utc_now(),
       utc_now(),
       3 + 2 + len(top_boards),
-      f"自动生成三因子 3 条、基线 2 条、象限候选 {len(top_boards)} 条。",
+      f"自动生成三因子 3 条、基线 2 条、象限候选 {len(top_boards)} 条。"
+      + ("" if breadth_available and top_boards else " 部分原始数据缺失，已按低置信度降级。"),
       {
         "top_themes": top_names,
         "denominator_score": round(denominator_score, 2),
         "macro_score": round(macro_score, 2),
         "structure_score": round(structure_score, 2),
+        "breadth_available": breadth_available,
+        "boards_available": bool(top_boards),
       },
     )
   )

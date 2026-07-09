@@ -13,10 +13,10 @@ export function createEmptyDashboard(date = today()): DashboardState {
       dominantForceLabel: "未生成",
       baselineDirection: "等待三因子数据",
       baselineStance: "balanced",
-      summary: "系统尚未采集或写入完整行情、宏观、结构叙事和象限数据，因此不会输出市场判断。",
+      summary: "系统尚未写入三因子和中短基线状态，因此不会输出市场判断。",
       factorRanking: [],
-      evidence: ["未发现完整的 factor_states、baseline_states、market_breadth 和 quadrant_items。"],
-      guidance: ["请先在数据源页确认采集配置，运行 ETL 后再生成决策链条。"]
+      evidence: ["未发现完整的 factor_states 和 baseline_states。"],
+      guidance: ["请先在数据源页确认采集配置，运行 ETL 后再生成决策链条。行情宽度或象限候选缺失时，系统会降级为部分数据状态。"]
     },
     mediumBaseline: {
       horizon: "medium",
