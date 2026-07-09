@@ -528,9 +528,7 @@ def main() -> int:
     return 0
 
   today = dt.date.today().isoformat()
-  statements: list[str] = [
-    "BEGIN TRANSACTION;",
-  ]
+  statements: list[str] = []
   breadth_state: dict[str, float] | None = None
   anchor_rows: dict[str, dict[str, Any]] = {}
   macro_observations: list[dict[str, Any]] = []
@@ -706,7 +704,6 @@ def main() -> int:
     statements.append(f"-- {message}")
     statements.append(collection_run_sql("model_derivation", "failed", model_started, utc_now(), 0, message))
 
-  statements.append("COMMIT;")
   OUT.parent.mkdir(parents=True, exist_ok=True)
   OUT.write_text("\n".join(statements) + "\n", encoding="utf-8")
   print(f"Wrote {OUT}")
