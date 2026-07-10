@@ -78,6 +78,44 @@ const freshnessLabel = {
   empty: "等待数据"
 };
 
+const collectionStages = [
+  {
+    id: "akshare_a_spot",
+    label: "A股实时行情",
+    required: true,
+    success: "写入 market_breadth / market_prices，四区间和分母可用。",
+    degraded: "A股行情失败，市场宽度、贴水/升水和短期情绪按中性低置信度处理。"
+  },
+  {
+    id: "akshare_macro",
+    label: "宏观慢变量",
+    required: true,
+    success: "写入 PMI、CPI/PPI、社融等总量分子数据。",
+    degraded: "宏观慢变量缺失，总量分子只能中性降级。"
+  },
+  {
+    id: "akshare_boards",
+    label: "行业与概念板块",
+    required: false,
+    success: "写入板块强弱，结构分子和四象限候选可用。",
+    degraded: "板块缺失，结构分子和四象限候选低置信度或为空。"
+  },
+  {
+    id: "yfinance_anchors",
+    label: "港美与商品锚",
+    required: true,
+    success: "写入外部锚资产，用于总量分母和中期基线确认。",
+    degraded: "外部锚缺失，分母外部压力和锚资产确认度下降。"
+  },
+  {
+    id: "model_derivation",
+    label: "模型状态自动派生",
+    required: true,
+    success: "写入三因子、基线和象限候选。",
+    degraded: "模型状态未写入，驾驶舱无法生成决策链条。"
+  }
+] as const;
+
 function App() {
   const [view, setView] = useState<ViewId>("dashboard");
   const [dashboard, setDashboard] = useState<DashboardState>(EMPTY_DASHBOARD);
@@ -766,6 +804,7 @@ function DataSourcesView({ state }: { state: DataSourceDashboard }) {
   const sources = drafts.map((draft) => draft.source);
   const enabledCount = sources.filter((source) => source.enabled).length;
   const successCount = state.runs.filter((run) => run.status === "success").length;
+  const dailyStatus = useMemo(() => buildDailyCollectionStatus(state.runs), [state.runs]);
 
   useEffect(() => {
     setDrafts(state.sources.map(createSourceDraft));
@@ -833,6 +872,8 @@ function DataSourcesView({ state }: { state: DataSourceDashboard }) {
         <span>{saveMessage}</span>
       </section>
 
+      <DailyCollectionStatusCard status={dailyStatus} />
+
       <section className="table-section">
         <div className="section-heading">
           <h2>数据源配置</h2>
@@ -876,6 +917,171 @@ function DataSourcesView({ state }: { state: DataSourceDashboard }) {
       </section>
     </div>
   );
+}
+
+type CollectionStageSummary = {
+  id: (typeof collectionStages)[number]["id"];
+  label: string;
+  required: boolean;
+  status: CollectionRun["status"] | "pending";
+  rowsWritten: number;
+  message: string;
+  startedAt?: string;
+  run?: CollectionRun;
+};
+
+type DailyCollectionStatus = {
+  dateKey: string;
+  latestAt?: string;
+  state: "complete" | "partial" | "failed" | "pending";
+  label: string;
+  progress: number;
+  attemptedCount: number;
+  successCount: number;
+  totalCount: number;
+  rowsWritten: number;
+  summary: string;
+  issues: string[];
+  stages: CollectionStageSummary[];
+};
+
+function DailyCollectionStatusCard({ status }: { status: DailyCollectionStatus }) {
+  return (
+    <section className={`daily-collection ${status.state}`}>
+      <div className="daily-collection-head">
+        <div>
+          <p className="eyebrow">北京时间 {status.dateKey}</p>
+          <h2>今日采集进度</h2>
+        </div>
+        <span className={`collection-state ${status.state}`}>{status.label}</span>
+      </div>
+
+      <div className="collection-progress-row">
+        <div className="collection-progress">
+          <div className="collection-progress-fill" style={{ width: `${status.progress}%` }} />
+        </div>
+        <strong>{status.attemptedCount}/{status.totalCount}</strong>
+        <span>成功 {status.successCount} 个阶段，写入 {status.rowsWritten} 行</span>
+      </div>
+
+      <p className="collection-summary">{status.summary}</p>
+
+      {status.latestAt && (
+        <div className="collection-meta-line">
+          <span>最近更新：{formatBeijingDateTime(status.latestAt)}</span>
+          <span>下次自动：交易日 17:20 北京时间</span>
+        </div>
+      )}
+
+      <div className="collection-stage-grid">
+        {status.stages.map((stage) => (
+          <article key={stage.id} className={`collection-stage ${stage.status}`}>
+            <div className="collection-stage-top">
+              <strong>{stage.label}</strong>
+              <span className={`run-status ${stage.status === "pending" ? "queued" : stage.status}`}>{stage.status}</span>
+            </div>
+            <span>{stage.startedAt ? formatBeijingDateTime(stage.startedAt) : "等待执行"}</span>
+            <p>{stage.message}</p>
+          </article>
+        ))}
+      </div>
+
+      {status.issues.length > 0 && <EvidenceList items={status.issues} />}
+    </section>
+  );
+}
+
+function buildDailyCollectionStatus(runs: CollectionRun[]): DailyCollectionStatus {
+  const latestRun = runs[0];
+  const dateKey = latestRun ? beijingDateKey(latestRun.startedAt) : beijingDateKey(new Date().toISOString());
+  const dayRuns = runs.filter((run) => beijingDateKey(run.startedAt) === dateKey);
+  const stages: CollectionStageSummary[] = collectionStages.map((stage) => {
+    const run = dayRuns.find((item) => item.sourceId === stage.id);
+    const status = run?.status ?? "pending";
+    const message = run
+      ? run.status === "success"
+        ? stage.success
+        : run.message || stage.degraded
+      : "等待本阶段返回运行结果。";
+    return {
+      id: stage.id,
+      label: stage.label,
+      required: stage.required,
+      status,
+      rowsWritten: run?.rowsWritten ?? 0,
+      message,
+      startedAt: run?.startedAt,
+      run
+    };
+  });
+  const attemptedCount = stages.filter((stage) => stage.status !== "pending").length;
+  const successCount = stages.filter((stage) => stage.status === "success").length;
+  const rowsWritten = stages.reduce((sum, stage) => sum + stage.rowsWritten, 0);
+  const failedStages = stages.filter((stage) => stage.status === "failed");
+  const skippedStages = stages.filter((stage) => stage.status === "skipped");
+  const pendingRequired = stages.filter((stage) => stage.required && stage.status === "pending");
+  const modelStage = stages.find((stage) => stage.id === "model_derivation");
+  const progress = Math.round((attemptedCount / collectionStages.length) * 100);
+
+  let state: DailyCollectionStatus["state"] = "pending";
+  if (modelStage?.status === "failed" || (pendingRequired.length > 0 && failedStages.length > 0)) {
+    state = "failed";
+  } else if (attemptedCount === collectionStages.length && failedStages.length === 0 && skippedStages.length === 0) {
+    state = "complete";
+  } else if (attemptedCount > 0) {
+    state = "partial";
+  }
+
+  const label =
+    state === "complete" ? "完整完成" : state === "partial" ? "部分完成" : state === "failed" ? "失败" : "等待执行";
+  const issues = stages
+    .filter((stage) => stage.status === "failed" || stage.status === "skipped" || (stage.required && stage.status === "pending"))
+    .map((stage) => `${stage.label}：${stage.message}`);
+  const summary =
+    state === "complete"
+      ? "今日采集链路完整完成，驾驶舱可以使用完整行情、宏观、结构和模型状态。"
+      : state === "partial"
+        ? "今日采集链路已返回，但存在失败或跳过阶段；驾驶舱会以部分数据和低置信度降级运行。"
+        : state === "failed"
+          ? "今日采集链路存在关键失败，模型状态可能不可用，需要重跑 GitHub Actions 或检查数据源。"
+          : "今日还没有采集结果，等待 GitHub Actions 定时任务或手动运行。";
+
+  return {
+    dateKey,
+    latestAt: latestRun?.startedAt,
+    state,
+    label,
+    progress,
+    attemptedCount,
+    successCount,
+    totalCount: collectionStages.length,
+    rowsWritten,
+    summary,
+    issues,
+    stages
+  };
+}
+
+function beijingDateKey(value: string) {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date(value));
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? "00";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+function formatBeijingDateTime(value: string) {
+  return new Date(value).toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    hour12: false,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
 }
 
 type SourceDraft = {
