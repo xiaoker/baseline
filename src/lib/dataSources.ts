@@ -12,7 +12,14 @@ export const DEFAULT_DATA_SOURCES: DataSourceConfig[] = [
     schedule: "交易日 17:20 Asia/Shanghai",
     targetTables: ["market_prices", "market_breadth"],
     freshnessHours: 28,
-    config: { script: "scripts/collect_market_data.py", package: "akshare", function: "stock_zh_a_spot_em", maxRows: 400 },
+    config: {
+      script: "scripts/collect_market_data.py",
+      package: "akshare",
+      primary: "eastmoney_direct_clist",
+      fallbacks: ["stock_zh_a_spot_em", "stock_zh_a_spot_sina"],
+      maxRows: 400,
+      retries: 3
+    },
     owner: "GitHub Actions Python ETL",
     notes: "首版只落前 400 行行情和全市场宽度统计，避免 D1 免费层写入过大。"
   },
@@ -30,7 +37,9 @@ export const DEFAULT_DATA_SOURCES: DataSourceConfig[] = [
     config: {
       script: "scripts/collect_market_data.py",
       package: "akshare",
+      primary: "eastmoney_direct_board_clist",
       functions: ["stock_board_industry_name_em", "stock_board_concept_name_em"],
+      fallbacks: ["stock_board_industry_name_em", "stock_board_concept_name_em"],
       maxThemes: 12
     },
     owner: "GitHub Actions Python ETL",

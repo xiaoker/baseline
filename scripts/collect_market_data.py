@@ -14,11 +14,34 @@ import json
 import math
 import os
 import pathlib
-from typing import Any, Optional
+import random
+import signal
+import time
+from typing import Any, Callable, Optional
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 OUT = ROOT / "tmp" / "d1-import.sql"
+
+HTTP_HEADERS = {
+  "User-Agent": (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+  ),
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+  "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+  "Origin": "https://quote.eastmoney.com",
+  "Connection": "close",
+}
+
+EASTMONEY_CLIST_HOSTS = [
+  "https://82.push2.eastmoney.com/api/qt/clist/get",
+  "https://48.push2.eastmoney.com/api/qt/clist/get",
+  "https://17.push2.eastmoney.com/api/qt/clist/get",
+  "https://79.push2.eastmoney.com/api/qt/clist/get",
+  "https://push2.eastmoney.com/api/qt/clist/get",
+]
 
 
 def sql_quote(value: Any) -> str:
@@ -87,6 +110,258 @@ def row_value(row: Any, names: list[str], default: Any = None) -> Any:
     except Exception:
       continue
   return default
+
+
+def short_error(exc: Exception) -> str:
+  return str(exc).replace("\n", " ")[:240]
+
+
+def retry_call(label: str, fn: Callable[[], Any], attempts: int = 3, base_delay: float = 1.2) -> Any:
+  errors: list[str] = []
+  for attempt in range(1, attempts + 1):
+    try:
+      return fn()
+    except Exception as exc:
+      errors.append(f"{label} attempt {attempt}: {short_error(exc)}")
+      if attempt < attempts:
+        time.sleep(base_delay * attempt + random.uniform(0.4, 1.2))
+  raise RuntimeError(" | ".join(errors))
+
+
+def call_with_timeout(label: str, fn: Callable[[], Any], seconds: int) -> Any:
+  if not hasattr(signal, "SIGALRM"):
+    return fn()
+
+  def timeout_handler(_signum: int, _frame: Any) -> None:
+    raise TimeoutError(f"{label} timed out after {seconds}s")
+
+  previous_handler = signal.signal(signal.SIGALRM, timeout_handler)
+  signal.alarm(seconds)
+  try:
+    return fn()
+  finally:
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, previous_handler)
+
+
+def eastmoney_diff_rows(diff: Any) -> list[Any]:
+  if isinstance(diff, dict):
+    return list(diff.values())
+  if isinstance(diff, list):
+    return diff
+  return []
+
+
+def fetch_eastmoney_page(
+  requests: Any,
+  hosts: list[str],
+  params: dict[str, str],
+  page: int,
+  page_size: int,
+) -> tuple[list[Any], int, str]:
+  page_errors: list[str] = []
+  shuffled_hosts = list(hosts)
+  random.shuffle(shuffled_hosts)
+  for url in shuffled_hosts:
+    try:
+      page_params = {**params, "pn": str(page), "pz": str(page_size)}
+
+      def request_payload() -> Any:
+        response = requests.get(url, params=page_params, headers=HTTP_HEADERS, timeout=18)
+        response.raise_for_status()
+        return response.json()
+
+      payload = retry_call(f"{url} page {page}", request_payload, attempts=1, base_delay=0.8)
+      data = payload.get("data") if isinstance(payload, dict) else None
+      rows = eastmoney_diff_rows(data.get("diff") if data else None)
+      total = int(data.get("total") or len(rows)) if data else 0
+      if not rows:
+        raise RuntimeError("empty page")
+      return rows, total, url
+    except Exception as exc:
+      page_errors.append(f"{url}: {short_error(exc)}")
+  raise RuntimeError(f"Eastmoney page {page} failed on all hosts: " + " || ".join(page_errors))
+
+
+def eastmoney_clist_frame(
+  pd: Any,
+  requests: Any,
+  params: dict[str, str],
+  rename_map: dict[str, str],
+  columns: list[str],
+  numeric_columns: list[str],
+  hosts: list[str] | None = None,
+  page_size: int = 500,
+) -> Any:
+  selected_hosts = hosts or EASTMONEY_CLIST_HOSTS
+  first_rows, total, first_host = fetch_eastmoney_page(requests, selected_hosts, params, 1, page_size)
+  rows = list(first_rows)
+  total_pages = max(1, math.ceil(total / max(len(first_rows), 1)))
+  for page in range(2, total_pages + 1):
+    time.sleep(random.uniform(0.2, 0.6))
+    page_rows, _, _ = fetch_eastmoney_page(requests, selected_hosts, params, page, page_size)
+    rows.extend(page_rows)
+
+  frame = pd.DataFrame(rows)
+  if frame.empty:
+    raise RuntimeError(f"empty dataframe from {first_host}")
+  frame.rename(columns=rename_map, inplace=True)
+  frame["序号"] = range(1, len(frame) + 1)
+  for column in numeric_columns:
+    if column in frame.columns:
+      frame[column] = pd.to_numeric(frame[column], errors="coerce")
+  for column in columns:
+    if column not in frame.columns:
+      frame[column] = None
+  return frame[columns]
+
+
+def fetch_eastmoney_a_spot(pd: Any) -> Any:
+  import requests
+
+  params = {
+    "po": "1",
+    "np": "1",
+    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+    "fltt": "2",
+    "invt": "2",
+    "fid": "f12",
+    "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+    "fields": (
+      "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,"
+      "f20,f21,f23,f24,f25,f22,f11,f62,f128,f136,f115,f152"
+    ),
+  }
+  rename_map = {
+    "f2": "最新价",
+    "f3": "涨跌幅",
+    "f4": "涨跌额",
+    "f5": "成交量",
+    "f6": "成交额",
+    "f7": "振幅",
+    "f8": "换手率",
+    "f9": "市盈率-动态",
+    "f10": "量比",
+    "f12": "代码",
+    "f14": "名称",
+    "f15": "最高",
+    "f16": "最低",
+    "f17": "今开",
+    "f18": "昨收",
+    "f20": "总市值",
+    "f21": "流通市值",
+    "f23": "市净率",
+    "f22": "涨速",
+    "f11": "5分钟涨跌",
+    "f24": "60日涨跌幅",
+    "f25": "年初至今涨跌幅",
+  }
+  columns = [
+    "序号",
+    "代码",
+    "名称",
+    "最新价",
+    "涨跌幅",
+    "涨跌额",
+    "成交量",
+    "成交额",
+    "振幅",
+    "最高",
+    "最低",
+    "今开",
+    "昨收",
+    "量比",
+    "换手率",
+    "市盈率-动态",
+    "市净率",
+    "总市值",
+    "流通市值",
+    "涨速",
+    "5分钟涨跌",
+    "60日涨跌幅",
+    "年初至今涨跌幅",
+  ]
+  errors: list[str] = []
+  for page_size in [1000, 500, 200]:
+    try:
+      return eastmoney_clist_frame(pd, requests, params, rename_map, columns, columns[3:], page_size=page_size)
+    except Exception as exc:
+      errors.append(f"page_size={page_size}: {short_error(exc)}")
+      time.sleep(random.uniform(0.4, 0.9))
+  raise RuntimeError("Eastmoney direct A-share adaptive page sizes failed: " + " || ".join(errors))
+
+
+def fetch_a_spot_frame(ak: Any, pd: Any) -> tuple[Any, str, list[str]]:
+  providers: list[tuple[str, Callable[[], Any], int]] = [
+    ("eastmoney_direct", lambda: fetch_eastmoney_a_spot(pd), 70),
+    ("akshare_stock_zh_a_spot_em", lambda: ak.stock_zh_a_spot_em(), 55),
+    ("akshare_stock_zh_a_spot_sina", lambda: ak.stock_zh_a_spot(), 90),
+  ]
+  diagnostics: list[str] = []
+  for provider, fn, timeout_seconds in providers:
+    try:
+      frame = call_with_timeout(provider, fn, timeout_seconds)
+      if getattr(frame, "empty", True):
+        raise RuntimeError("empty dataframe")
+      required = ["代码", "名称", "最新价", "涨跌幅", "成交额", "成交量"]
+      missing = [column for column in required if column not in frame.columns]
+      if missing:
+        raise RuntimeError(f"missing columns: {', '.join(missing)}")
+      frame.attrs["provider"] = provider
+      frame.attrs["diagnostics"] = diagnostics
+      return frame, provider, diagnostics
+    except Exception as exc:
+      diagnostics.append(f"{provider}: {short_error(exc)}")
+  raise RuntimeError("A-share spot all providers failed: " + " || ".join(diagnostics))
+
+
+def fetch_eastmoney_board_frame(pd: Any, board_kind: str) -> Any:
+  import requests
+
+  fs = "m:90 t:2 f:!50" if board_kind == "industry" else "m:90 t:3 f:!50"
+  params = {
+    "po": "1",
+    "np": "1",
+    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+    "fltt": "2",
+    "invt": "2",
+    "fid": "f3" if board_kind == "industry" else "f12",
+    "fs": fs,
+    "fields": (
+      "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,"
+      "f23,f24,f25,f26,f22,f33,f11,f62,f128,f136,f115,f152,f124,f107,f104,f105,"
+      "f140,f141,f207,f208,f209,f222"
+    ),
+  }
+  rename_map = {
+    "f2": "最新价",
+    "f3": "涨跌幅",
+    "f4": "涨跌额",
+    "f8": "换手率",
+    "f12": "板块代码",
+    "f14": "板块名称",
+    "f20": "总市值",
+    "f104": "上涨家数",
+    "f105": "下跌家数",
+    "f128": "领涨股票",
+    "f136": "领涨股票-涨跌幅",
+  }
+  columns = [
+    "序号",
+    "板块名称",
+    "板块代码",
+    "最新价",
+    "涨跌额",
+    "涨跌幅",
+    "总市值",
+    "换手率",
+    "上涨家数",
+    "下跌家数",
+    "领涨股票",
+    "领涨股票-涨跌幅",
+  ]
+  numeric_columns = ["最新价", "涨跌额", "涨跌幅", "总市值", "换手率", "上涨家数", "下跌家数", "领涨股票-涨跌幅"]
+  return eastmoney_clist_frame(pd, requests, params, rename_map, columns, numeric_columns, page_size=200)
 
 
 def direction_from_score(score: float) -> str:
@@ -242,18 +517,38 @@ def fetch_macro_observations(ak: Any, trade_date: str) -> tuple[list[str], list[
   return statements, observations
 
 
-def build_board_candidates(ak: Any) -> list[dict[str, Any]]:
+def fetch_board_frame(ak: Any, pd: Any, board_kind: str, function_name: str) -> tuple[Any, str]:
+  providers: list[tuple[str, Callable[[], Any], int]] = [
+    (f"eastmoney_direct_{board_kind}", lambda: fetch_eastmoney_board_frame(pd, board_kind), 45),
+    (f"akshare_{function_name}", lambda: getattr(ak, function_name)(), 45),
+  ]
+  errors: list[str] = []
+  for provider, fn, timeout_seconds in providers:
+    try:
+      frame = call_with_timeout(provider, fn, timeout_seconds)
+      if getattr(frame, "empty", True):
+        raise RuntimeError("empty dataframe")
+      return frame, provider
+    except Exception as exc:
+      errors.append(f"{provider}: {short_error(exc)}")
+  raise RuntimeError("board providers failed: " + " || ".join(errors))
+
+
+def build_board_candidates(ak: Any, pd: Any) -> tuple[list[dict[str, Any]], list[str]]:
   candidates: list[dict[str, Any]] = []
+  diagnostics: list[str] = []
   board_sources = [
     ("industry", "行业板块", "stock_board_industry_name_em"),
     ("concept", "概念板块", "stock_board_concept_name_em"),
   ]
   for board_kind, board_label, function_name in board_sources:
     try:
-      frame = getattr(ak, function_name)()
-    except Exception:
+      frame, provider = fetch_board_frame(ak, pd, board_kind, function_name)
+    except Exception as exc:
+      diagnostics.append(f"{board_label}: {short_error(exc)}")
       continue
     if getattr(frame, "empty", True):
+      diagnostics.append(f"{board_label}: empty dataframe")
       continue
     for _, row in frame.iterrows():
       name = str(row_value(row, ["板块名称", "行业名称", "概念名称", "名称"], "")).strip()
@@ -284,10 +579,11 @@ def build_board_candidates(ak: Any) -> list[dict[str, Any]]:
           "strength_score": strength_score,
           "heat_score": heat_score,
           "liquidity_score": liquidity_score,
+          "provider": provider,
           "raw": row.to_json(force_ascii=False),
         }
       )
-  return sorted(candidates, key=lambda item: (item["strength_score"], item["heat_score"]), reverse=True)
+  return sorted(candidates, key=lambda item: (item["strength_score"], item["heat_score"]), reverse=True), diagnostics
 
 
 def anchor_trend(anchor_rows: dict[str, dict[str, Any]], symbols: list[str]) -> float:
@@ -557,10 +853,11 @@ def main() -> int:
   anchor_rows: dict[str, dict[str, Any]] = {}
   macro_observations: list[dict[str, Any]] = []
   board_candidates: list[dict[str, Any]] = []
+  board_diagnostics: list[str] = []
 
   akshare_started = utc_now()
   try:
-    spot = ak.stock_zh_a_spot_em()
+    spot, spot_provider, spot_diagnostics = fetch_a_spot_frame(ak, pd)
     advancers = int((spot["涨跌幅"] > 0).sum())
     decliners = int((spot["涨跌幅"] < 0).sum())
     limit_up = int((spot["涨跌幅"] >= 9.8).sum())
@@ -591,7 +888,7 @@ def main() -> int:
       f"VALUES ({sql_quote(today)}, {advancers}, {decliners}, {limit_up}, {limit_down}, "
       f"{turnover_cny_bn:.2f}, {volatility_score:.2f}, {dispersion_score:.2f}, "
       f"{sentiment_score:.2f}, {premium_discount_score:.2f}, {heat_score:.2f}, "
-      f"{sql_quote(json.dumps({'rows': len(spot)}, ensure_ascii=False))});"
+      f"{sql_quote(json.dumps({'rows': len(spot), 'provider': spot_provider, 'diagnostics': spot_diagnostics}, ensure_ascii=False))});"
     )
 
     rows_written = 1
@@ -612,12 +909,12 @@ def main() -> int:
         akshare_started,
         utc_now(),
         rows_written,
-        f"写入 market_breadth 1 行、market_prices {rows_written - 1} 行。",
-        {"source_rows": len(spot)},
+        f"通过 {spot_provider} 写入 market_breadth 1 行、market_prices {rows_written - 1} 行。",
+        {"source_rows": len(spot), "provider": spot_provider, "diagnostics": spot_diagnostics},
       )
     )
   except Exception as exc:
-    message = f"AKShare A-share fetch failed: {str(exc).replace(chr(10), ' ')}"
+    message = f"A-share fetch failed after Eastmoney direct, AKShare Eastmoney and Sina fallbacks: {short_error(exc)}"
     statements.append(f"-- {message}")
     statements.append(collection_run_sql("akshare_a_spot", "failed", akshare_started, utc_now(), 0, message))
 
@@ -643,7 +940,7 @@ def main() -> int:
 
   boards_started = utc_now()
   try:
-    board_candidates = build_board_candidates(ak)
+    board_candidates, board_diagnostics = build_board_candidates(ak, pd)
     statements.append(
       collection_run_sql(
         "akshare_boards",
@@ -653,12 +950,13 @@ def main() -> int:
         len(board_candidates),
         f"读取行业/概念板块 {len(board_candidates)} 条，用于结构分子、基线和四象限派生。"
         if board_candidates
-        else "未获取到行业/概念板块，结构分子将低置信度处理。",
-        {"top": [item["name"] for item in board_candidates[:10]]},
+        else "未获取到行业/概念板块，结构分子将低置信度处理。"
+        + (f" 诊断：{' | '.join(board_diagnostics)}" if board_diagnostics else ""),
+        {"top": [item["name"] for item in board_candidates[:10]], "diagnostics": board_diagnostics},
       )
     )
   except Exception as exc:
-    message = f"AKShare board fetch failed: {str(exc).replace(chr(10), ' ')}"
+    message = f"board fetch failed after Eastmoney direct and AKShare fallbacks: {short_error(exc)}"
     statements.append(f"-- {message}")
     statements.append(collection_run_sql("akshare_boards", "failed", boards_started, utc_now(), 0, message))
 
