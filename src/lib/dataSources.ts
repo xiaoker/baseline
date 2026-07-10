@@ -4,7 +4,7 @@ export const DEFAULT_DATA_SOURCES: DataSourceConfig[] = [
   {
     id: "akshare_a_spot",
     name: "A股实时行情",
-    provider: "AKShare",
+    provider: "腾讯财经（主）/ AKShare（备）",
     kind: "akshare",
     category: "market",
     purpose: "采集全市场个股价格、涨跌幅、成交额，用于市场宽度、情绪、热度和个股基础行情。",
@@ -14,14 +14,15 @@ export const DEFAULT_DATA_SOURCES: DataSourceConfig[] = [
     freshnessHours: 28,
     config: {
       script: "scripts/collect_market_data.py",
-      package: "akshare",
-      primary: "eastmoney_direct_clist",
-      fallbacks: ["stock_zh_a_spot_em", "stock_zh_a_spot_sina"],
+      primary: "tencent_getBoardRankList",
+      endpoint: "https://proxy.finance.qq.com/cgi/cgi-bin/rank/hs/getBoardRankList",
+      pageSize: 200,
+      fallbacks: ["eastmoney_direct_clist", "stock_zh_a_spot_em", "stock_zh_a_spot_sina"],
       maxRows: 400,
       retries: 3
     },
     owner: "GitHub Actions Python ETL",
-    notes: "首版只落前 400 行行情和全市场宽度统计，避免 D1 免费层写入过大。"
+    notes: "腾讯接口负责全市场宽度，D1 只落前 400 行个股行情；每次运行会记录实际命中的 provider。"
   },
   {
     id: "akshare_boards",

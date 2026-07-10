@@ -43,6 +43,14 @@ EASTMONEY_CLIST_HOSTS = [
   "https://push2.eastmoney.com/api/qt/clist/get",
 ]
 
+TENCENT_RANK_URL = "https://proxy.finance.qq.com/cgi/cgi-bin/rank/hs/getBoardRankList"
+TENCENT_HEADERS = {
+  "User-Agent": HTTP_HEADERS["User-Agent"],
+  "Accept": "application/json, text/plain, */*",
+  "Accept-Language": HTTP_HEADERS["Accept-Language"],
+  "Referer": "https://stockapp.finance.qq.com/mstats/",
+}
+
 
 def sql_quote(value: Any) -> str:
   if value is None:
@@ -291,8 +299,130 @@ def fetch_eastmoney_a_spot(pd: Any) -> Any:
   raise RuntimeError("Eastmoney direct A-share adaptive page sizes failed: " + " || ".join(errors))
 
 
+def normalize_tencent_a_spot(pd: Any, rows: list[dict[str, Any]]) -> Any:
+  frame = pd.DataFrame(rows)
+  if frame.empty:
+    raise RuntimeError("Tencent returned an empty dataframe")
+
+  rename_map = {
+    "code": "代码",
+    "name": "名称",
+    "zxj": "最新价",
+    "zdf": "涨跌幅",
+    "zd": "涨跌额",
+    "volume": "成交量",
+    "turnover": "成交额",
+    "zf": "振幅",
+    "hsl": "换手率",
+    "pe_ttm": "市盈率-动态",
+    "pn": "市净率",
+    "lb": "量比",
+    "zsz": "总市值",
+    "ltsz": "流通市值",
+    "speed": "涨速",
+    "zdf_d60": "60日涨跌幅",
+    "zdf_y": "年初至今涨跌幅",
+  }
+  frame.rename(columns=rename_map, inplace=True)
+  frame["代码"] = frame["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
+
+  numeric_columns = [column for column in rename_map.values() if column not in {"代码", "名称"}]
+  for column in numeric_columns:
+    if column in frame.columns:
+      frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+  # Tencent rank data reports turnover in CNY 10,000 and market cap in CNY 100m.
+  frame["成交额"] = frame["成交额"] * 10_000
+  frame["总市值"] = frame["总市值"] * 100_000_000
+  frame["流通市值"] = frame["流通市值"] * 100_000_000
+  frame["序号"] = range(1, len(frame) + 1)
+
+  columns = [
+    "序号",
+    "代码",
+    "名称",
+    "最新价",
+    "涨跌幅",
+    "涨跌额",
+    "成交量",
+    "成交额",
+    "振幅",
+    "量比",
+    "换手率",
+    "市盈率-动态",
+    "市净率",
+    "总市值",
+    "流通市值",
+    "涨速",
+    "60日涨跌幅",
+    "年初至今涨跌幅",
+  ]
+  for column in columns:
+    if column not in frame.columns:
+      frame[column] = None
+  return frame[columns]
+
+
+def fetch_tencent_a_spot(pd: Any, requests_module: Any = None) -> Any:
+  if requests_module is None:
+    import requests as requests_module
+
+  page_size = 200
+
+  def fetch_page(offset: int) -> tuple[list[dict[str, Any]], int]:
+    params = {
+      "_appver": "11.17.0",
+      "board_code": "aStock",
+      "sort_type": "price",
+      "direct": "down",
+      "offset": str(offset),
+      "count": str(page_size),
+    }
+
+    def request_payload() -> Any:
+      response = requests_module.get(
+        TENCENT_RANK_URL,
+        params=params,
+        headers=TENCENT_HEADERS,
+        timeout=15,
+      )
+      response.raise_for_status()
+      return response.json()
+
+    payload = retry_call(f"Tencent offset {offset}", request_payload, attempts=3, base_delay=0.8)
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+      raise RuntimeError(f"Tencent offset {offset} rejected: {payload}")
+    data = payload.get("data") or {}
+    rows = data.get("rank_list") or []
+    total = int(data.get("total") or len(rows))
+    if not isinstance(rows, list) or not rows:
+      raise RuntimeError(f"Tencent offset {offset} returned no rows")
+    return rows, total
+
+  first_rows, total = fetch_page(0)
+  rows = list(first_rows)
+  for offset in range(page_size, total, page_size):
+    time.sleep(random.uniform(0.08, 0.2))
+    page_rows, _ = fetch_page(offset)
+    rows.extend(page_rows)
+
+  unique_rows: dict[str, dict[str, Any]] = {}
+  for row in rows:
+    code = str(row.get("code") or "")
+    if code:
+      unique_rows[code] = row
+  coverage = len(unique_rows) / max(total, 1)
+  if total < 3000 or coverage < 0.98:
+    raise RuntimeError(
+      f"Tencent market coverage incomplete: total={total}, rows={len(rows)}, "
+      f"unique={len(unique_rows)}, coverage={coverage:.2%}"
+    )
+  return normalize_tencent_a_spot(pd, list(unique_rows.values()))
+
+
 def fetch_a_spot_frame(ak: Any, pd: Any) -> tuple[Any, str, list[str]]:
   providers: list[tuple[str, Callable[[], Any], int]] = [
+    ("tencent_direct", lambda: fetch_tencent_a_spot(pd), 55),
     ("eastmoney_direct", lambda: fetch_eastmoney_a_spot(pd), 70),
     ("akshare_stock_zh_a_spot_em", lambda: ak.stock_zh_a_spot_em(), 55),
     ("akshare_stock_zh_a_spot_sina", lambda: ak.stock_zh_a_spot(), 90),
@@ -313,6 +443,14 @@ def fetch_a_spot_frame(ak: Any, pd: Any) -> tuple[Any, str, list[str]]:
     except Exception as exc:
       diagnostics.append(f"{provider}: {short_error(exc)}")
   raise RuntimeError("A-share spot all providers failed: " + " || ".join(diagnostics))
+
+
+def market_price_source(provider: str) -> str:
+  if provider.startswith("tencent"):
+    return "tencent"
+  if provider.startswith("eastmoney"):
+    return "eastmoney"
+  return "akshare"
 
 
 def fetch_eastmoney_board_frame(pd: Any, board_kind: str) -> Any:
@@ -858,6 +996,7 @@ def main() -> int:
   akshare_started = utc_now()
   try:
     spot, spot_provider, spot_diagnostics = fetch_a_spot_frame(ak, pd)
+    spot_source = market_price_source(spot_provider)
     advancers = int((spot["涨跌幅"] > 0).sum())
     decliners = int((spot["涨跌幅"] < 0).sum())
     limit_up = int((spot["涨跌幅"] >= 9.8).sum())
@@ -898,7 +1037,7 @@ def main() -> int:
         "(trade_date, symbol, name, market, asset_type, close, change_pct, turnover, volume, source, raw_json) "
         f"VALUES ({sql_quote(today)}, {sql_quote(row.get('代码'))}, {sql_quote(row.get('名称'))}, "
         f"'CN', 'stock', {float(row.get('最新价') or 0):.4f}, {float(row.get('涨跌幅') or 0):.4f}, "
-        f"{float(row.get('成交额') or 0):.2f}, {float(row.get('成交量') or 0):.2f}, 'akshare', "
+        f"{float(row.get('成交额') or 0):.2f}, {float(row.get('成交量') or 0):.2f}, {sql_quote(spot_source)}, "
         f"{sql_quote(row.to_json(force_ascii=False))});"
       )
       rows_written += 1
@@ -914,7 +1053,7 @@ def main() -> int:
       )
     )
   except Exception as exc:
-    message = f"A-share fetch failed after Eastmoney direct, AKShare Eastmoney and Sina fallbacks: {short_error(exc)}"
+    message = f"A-share fetch failed after Tencent, Eastmoney and Sina providers: {short_error(exc)}"
     statements.append(f"-- {message}")
     statements.append(collection_run_sql("akshare_a_spot", "failed", akshare_started, utc_now(), 0, message))
 

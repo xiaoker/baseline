@@ -2,6 +2,13 @@ name: Collect market data
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/collect_market_data.py"
+      - "requirements.txt"
+      - ".github/workflows/collect-market-data.yml"
   schedule:
     - cron: "20 9 * * 1-5"
 
