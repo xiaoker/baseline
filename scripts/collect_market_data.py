@@ -1029,6 +1029,10 @@ def main() -> int:
       f"{sentiment_score:.2f}, {premium_discount_score:.2f}, {heat_score:.2f}, "
       f"{sql_quote(json.dumps({'rows': len(spot), 'provider': spot_provider, 'diagnostics': spot_diagnostics}, ensure_ascii=False))});"
     )
+    statements.append(
+      "DELETE FROM market_prices "
+      f"WHERE trade_date = {sql_quote(today)} AND market = 'CN' AND asset_type = 'stock';"
+    )
 
     rows_written = 1
     for _, row in spot.head(400).iterrows():
