@@ -17,7 +17,7 @@ export const DEFAULT_DATA_SOURCES: DataSourceConfig[] = [
       primary: "tencent_getBoardRankList",
       endpoint: "https://proxy.finance.qq.com/cgi/cgi-bin/rank/hs/getBoardRankList",
       pageSize: 200,
-      fallbacks: ["eastmoney_direct_clist", "stock_zh_a_spot_em", "stock_zh_a_spot_sina"],
+      fallbacks: ["eastmoney_direct_clist", "stock_zh_a_spot_em"],
       maxRows: 400,
       retries: 3
     },
@@ -27,7 +27,7 @@ export const DEFAULT_DATA_SOURCES: DataSourceConfig[] = [
   {
     id: "akshare_boards",
     name: "行业与概念板块",
-    provider: "AKShare",
+    provider: "东方财富（主）/ 同花顺（备）",
     kind: "akshare",
     category: "market",
     purpose: "采集行业和概念板块强弱、扩散、热度，用于自动识别结构分子、短期故事和四象限候选。",
@@ -37,14 +37,14 @@ export const DEFAULT_DATA_SOURCES: DataSourceConfig[] = [
     freshnessHours: 28,
     config: {
       script: "scripts/collect_market_data.py",
-      package: "akshare",
       primary: "eastmoney_direct_board_clist",
-      functions: ["stock_board_industry_name_em", "stock_board_concept_name_em"],
-      fallbacks: ["stock_board_industry_name_em", "stock_board_concept_name_em"],
+      primaryEndpoint: "https://push2.eastmoney.com/api/qt/clist/get",
+      fallback: "ths_direct_board_snapshot",
+      fallbackEndpoints: ["https://q.10jqka.com.cn/thshy/", "https://q.10jqka.com.cn/gn/"],
       maxThemes: 12
     },
     owner: "GitHub Actions Python ETL",
-    notes: "该数据只用于板块强弱和主题识别；产业订单/产能仍需要事件证据或人工确认补强。"
+    notes: "东方财富不可用时自动切换同花顺；同花顺概念缺少扩散家数时按中性处理，不使用新浪数据。"
   },
   {
     id: "akshare_macro",

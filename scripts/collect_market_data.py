@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+from io import StringIO
 import json
 import math
 import os
@@ -50,6 +51,9 @@ TENCENT_HEADERS = {
   "Accept-Language": HTTP_HEADERS["Accept-Language"],
   "Referer": "https://stockapp.finance.qq.com/mstats/",
 }
+
+THS_INDUSTRY_URL = "https://q.10jqka.com.cn/thshy/index/field/199112/order/desc/page/{page}/ajax/1/"
+THS_CONCEPT_URL = "https://q.10jqka.com.cn/gn/"
 
 
 def sql_quote(value: Any) -> str:
@@ -425,7 +429,6 @@ def fetch_a_spot_frame(ak: Any, pd: Any) -> tuple[Any, str, list[str]]:
     ("tencent_direct", lambda: fetch_tencent_a_spot(pd), 55),
     ("eastmoney_direct", lambda: fetch_eastmoney_a_spot(pd), 70),
     ("akshare_stock_zh_a_spot_em", lambda: ak.stock_zh_a_spot_em(), 55),
-    ("akshare_stock_zh_a_spot_sina", lambda: ak.stock_zh_a_spot(), 90),
   ]
   diagnostics: list[str] = []
   for provider, fn, timeout_seconds in providers:
@@ -500,6 +503,120 @@ def fetch_eastmoney_board_frame(pd: Any, board_kind: str) -> Any:
   ]
   numeric_columns = ["最新价", "涨跌额", "涨跌幅", "总市值", "换手率", "上涨家数", "下跌家数", "领涨股票-涨跌幅"]
   return eastmoney_clist_frame(pd, requests, params, rename_map, columns, numeric_columns, page_size=200)
+
+
+def ths_request_headers() -> dict[str, str]:
+  from akshare.datasets import get_ths_js
+  import py_mini_racer
+
+  js_runtime = py_mini_racer.MiniRacer()
+  with open(get_ths_js("ths.js"), encoding="utf-8") as source:
+    js_runtime.eval(source.read())
+  token = js_runtime.call("v")
+  return {
+    "User-Agent": HTTP_HEADERS["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": HTTP_HEADERS["Accept-Language"],
+    "Referer": "https://q.10jqka.com.cn/",
+    "Cookie": f"v={token}",
+    "hexin-v": token,
+  }
+
+
+def normalize_ths_industry_frame(pd: Any, frame: Any) -> Any:
+  normalized = frame.copy()
+  normalized.rename(
+    columns={
+      "板块": "板块名称",
+      "涨跌幅(%)": "涨跌幅",
+      "总成交额（亿元）": "成交额",
+      "领涨股": "领涨股票",
+      "涨跌幅(%).1": "领涨股票-涨跌幅",
+    },
+    inplace=True,
+  )
+  normalized["板块代码"] = normalized["板块名称"].map(lambda name: stable_id("ths_industry", str(name)))
+  normalized["成交额"] = pd.to_numeric(normalized["成交额"], errors="coerce") * 100_000_000
+  columns = [
+    "板块名称",
+    "板块代码",
+    "涨跌幅",
+    "成交额",
+    "上涨家数",
+    "下跌家数",
+    "领涨股票",
+    "领涨股票-涨跌幅",
+  ]
+  for column in columns:
+    if column not in normalized.columns:
+      normalized[column] = None
+  return normalized[columns]
+
+
+def normalize_ths_concept_frame(pd: Any, rows: list[dict[str, Any]]) -> Any:
+  frame = pd.DataFrame(rows)
+  frame.rename(
+    columns={
+      "platename": "板块名称",
+      "cid": "板块代码",
+      "199112": "涨跌幅",
+      "zjjlr": "净流入（亿元）",
+      "zfl": "上涨占比",
+    },
+    inplace=True,
+  )
+  columns = ["板块名称", "板块代码", "涨跌幅", "净流入（亿元）", "上涨占比"]
+  for column in columns:
+    if column not in frame.columns:
+      frame[column] = None
+  for column in ["涨跌幅", "净流入（亿元）", "上涨占比"]:
+    frame[column] = pd.to_numeric(frame[column], errors="coerce")
+  return frame[columns]
+
+
+def fetch_ths_board_frame(pd: Any, board_kind: str, requests_module: Any = None) -> Any:
+  if requests_module is None:
+    import requests as requests_module
+  from bs4 import BeautifulSoup
+
+  headers = ths_request_headers()
+
+  def fetch_html(url: str) -> str:
+    def request_page() -> str:
+      response = requests_module.get(url, headers=headers, timeout=20)
+      response.raise_for_status()
+      return response.text
+
+    return retry_call(f"THS {board_kind} {url}", request_page, attempts=2, base_delay=0.8)
+
+  if board_kind == "industry":
+    first_html = fetch_html(THS_INDUSTRY_URL.format(page=1))
+    soup = BeautifulSoup(first_html, "lxml")
+    page_info = soup.find("span", class_="page_info")
+    page_count = int(page_info.get_text(strip=True).split("/")[-1]) if page_info else 1
+    frames = [pd.read_html(StringIO(first_html))[0]]
+    for page in range(2, page_count + 1):
+      time.sleep(random.uniform(0.12, 0.3))
+      frames.append(pd.read_html(StringIO(fetch_html(THS_INDUSTRY_URL.format(page=page))))[0])
+    frame = normalize_ths_industry_frame(pd, pd.concat(frames, ignore_index=True))
+    if len(frame) < 40:
+      raise RuntimeError(f"THS industry coverage incomplete: {len(frame)} rows")
+    return frame
+
+  if board_kind == "concept":
+    concept_html = fetch_html(THS_CONCEPT_URL)
+    soup = BeautifulSoup(concept_html, "lxml")
+    snapshot = soup.find(id="gnSection")
+    if snapshot is None or not snapshot.get("value"):
+      raise RuntimeError("THS concept snapshot gnSection is missing")
+    payload = json.loads(snapshot["value"])
+    rows = list(payload.values()) if isinstance(payload, dict) else []
+    frame = normalize_ths_concept_frame(pd, rows)
+    if len(frame) < 100:
+      raise RuntimeError(f"THS concept coverage incomplete: {len(frame)} rows")
+    return frame
+
+  raise ValueError(f"Unsupported THS board kind: {board_kind}")
 
 
 def direction_from_score(score: float) -> str:
@@ -655,10 +772,10 @@ def fetch_macro_observations(ak: Any, trade_date: str) -> tuple[list[str], list[
   return statements, observations
 
 
-def fetch_board_frame(ak: Any, pd: Any, board_kind: str, function_name: str) -> tuple[Any, str]:
+def fetch_board_frame(_ak: Any, pd: Any, board_kind: str, _function_name: str) -> tuple[Any, str]:
   providers: list[tuple[str, Callable[[], Any], int]] = [
     (f"eastmoney_direct_{board_kind}", lambda: fetch_eastmoney_board_frame(pd, board_kind), 45),
-    (f"akshare_{function_name}", lambda: getattr(ak, function_name)(), 45),
+    (f"ths_direct_{board_kind}", lambda: fetch_ths_board_frame(pd, board_kind), 55),
   ]
   errors: list[str] = []
   for provider, fn, timeout_seconds in providers:
@@ -694,10 +811,12 @@ def build_board_candidates(ak: Any, pd: Any) -> tuple[list[dict[str, Any]], list
         continue
       pct = safe_float(row_value(row, ["涨跌幅", "涨跌幅%", "涨幅"], 0))
       turnover = safe_float(row_value(row, ["换手率", "换手率%", "换手"], 0))
-      advancers = safe_float(row_value(row, ["上涨家数", "上涨数"], 0))
-      decliners = safe_float(row_value(row, ["下跌家数", "下跌数"], 0))
-      total = max(advancers + decliners, 1)
-      advancer_ratio = advancers / total
+      advancers_value = row_value(row, ["上涨家数", "上涨数"], None)
+      decliners_value = row_value(row, ["下跌家数", "下跌数"], None)
+      advancers = safe_float(advancers_value, 0)
+      decliners = safe_float(decliners_value, 0)
+      breadth_available = advancers_value is not None and decliners_value is not None and advancers + decliners > 0
+      advancer_ratio = advancers / (advancers + decliners) if breadth_available else 0.5
       leader = str(row_value(row, ["领涨股票", "领涨股"], "") or "")
       amount = safe_float(row_value(row, ["成交额", "总成交额"], 0))
       strength_score = clamp(50 + pct * 7 + (advancer_ratio - 0.5) * 34)
@@ -713,6 +832,7 @@ def build_board_candidates(ak: Any, pd: Any) -> tuple[list[dict[str, Any]], list
           "advancers": advancers,
           "decliners": decliners,
           "advancer_ratio": advancer_ratio,
+          "breadth_available": breadth_available,
           "leader": leader,
           "strength_score": strength_score,
           "heat_score": heat_score,
@@ -852,12 +972,18 @@ def derive_model_state(
   for index, board in enumerate(top_boards):
     theme_id = stable_id("theme", f"{board['kind']}:{board['name']}")
     role = "medium_core" if index < 5 and structure_score >= 60 else "short_trade"
+    board_source = "东方财富" if board["provider"].startswith("eastmoney") else "同花顺"
+    breadth_evidence = (
+      f"上涨家数 {board['advancers']:.0f}，下跌家数 {board['decliners']:.0f}。"
+      if board["breadth_available"]
+      else "数据源未提供上涨/下跌家数，扩散度按中性处理。"
+    )
     evidence = [
       f"{board['label']}涨跌幅 {board['pct']:.2f}%，换手率 {board['turnover']:.2f}%。",
-      f"上涨家数 {board['advancers']:.0f}，下跌家数 {board['decliners']:.0f}，领涨股票：{board['leader'] or '未知'}。",
-      "该主题由 AKShare 板块强弱自动识别，不等同于人工确认的产业景气。",
+      f"{breadth_evidence}领涨股票：{board['leader'] or '未知'}。",
+      f"该主题由{board_source}板块强弱自动识别，不等同于人工确认的产业景气。",
     ]
-    statements.append(theme_sql(theme_id, board["name"], "AKShare 板块强弱自动识别主题。", role))
+    statements.append(theme_sql(theme_id, board["name"], f"{board_source}板块强弱自动识别主题。", role))
     statements.append(narrative_event_sql(trade_date, theme_id, f"自动识别强势{board['label']}：{board['name']}", board["strength_score"], evidence))
     item = {
       "symbol": theme_id,
@@ -1057,7 +1183,7 @@ def main() -> int:
       )
     )
   except Exception as exc:
-    message = f"A-share fetch failed after Tencent, Eastmoney and Sina providers: {short_error(exc)}"
+    message = f"A-share fetch failed after Tencent and Eastmoney providers: {short_error(exc)}"
     statements.append(f"-- {message}")
     statements.append(collection_run_sql("akshare_a_spot", "failed", akshare_started, utc_now(), 0, message))
 
